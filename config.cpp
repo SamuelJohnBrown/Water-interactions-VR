@@ -1,4 +1,5 @@
 #include "config.h"
+#include "water_coll_det.h"
 #include <algorithm>
 #include <cctype>
 #include <filesystem>
@@ -69,6 +70,7 @@ namespace InteractiveWaterVR
  float cfgWakeMaxMultiplier =2.0f; // max multiplier applied to cfgWakeAmt
  // Wake movement sound volume (0.0..1.0+)
  float cfgWakeMoveSoundVol =0.8f; // default volume for wake movement sound
+ float cfgTrackingLossSplashDelaySeconds = 2.0f; // default 2 seconds
 
  static inline void trim(std::string& s)
  {
@@ -258,6 +260,13 @@ namespace InteractiveWaterVR
  else if (varName == "MaxMultiplier") cfgWakeMaxMultiplier = std::stof(value);
  else if (varName == "WaveAmt" || varName == "WaveSize" || varName == "Amt") cfgWakeAmt = std::stof(value);
  else if (varName == "WakeMoveSoundVol") cfgWakeMoveSoundVol = std::stof(value);
+ } catch (...) {
+ }
+ } else if (currentSection == "Loss") {
+ std::string varName;
+ auto value = GetConfigSettingsStringValue(line, varName);
+ try {
+ if (varName == "TrackingLossSplashDelaySeconds") cfgTrackingLossSplashDelaySeconds = std::stof(value);
  } catch (...) {
  }
  }

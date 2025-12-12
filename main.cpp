@@ -5,7 +5,7 @@
 #include "higgsinterface.h"
 #include "helper.h"
 #include "engine.h"
-#include "water_detection.h"
+#include "water_coll_det.h"
 #include <cstdint>
 #include <fstream>
 #include <cstdlib>
@@ -100,7 +100,7 @@ static void OnSKSEMessage(SKSE::MessagingInterface::Message* msg)
 		IW_LOG_INFO("Interactive_Water_VR: received kPostLoadGame - scheduling module start");
 		InteractiveWaterVR::AppendToPluginLog("INFO", "PostLoadGame: scheduling StartMod (from load event)");
 
-		InteractiveWaterVR::ScheduleStartMod(5); //5 second delay before starting water detection
+		InteractiveWaterVR::ScheduleStartMod(2); //5 second delay before starting water detection
 		break;
 	}
 	case SKSE::MessagingInterface::kNewGame: {

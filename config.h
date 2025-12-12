@@ -4,6 +4,7 @@
 #include <fstream>
 #include <cstdarg>
 #include "helper.h"
+#include "water_coll_det.h"
 
 namespace InteractiveWaterVR
 {
@@ -71,6 +72,9 @@ namespace InteractiveWaterVR
  extern float cfgWakeMinMultiplier; // minimum multiplier applied to base cfgWakeAmt
  extern float cfgWakeMaxMultiplier; // maximum multiplier applied to base cfgWakeAmt
  extern float cfgWakeMoveSoundVol; // volume for wake movement sound
+
+ // Tracking loss splash delay
+ extern float cfgTrackingLossSplashDelaySeconds; // delay before splash when tracking is lost
 
  // Load configuration from Data\\SKSE\\Plugins\\Interactive_Water_VR.ini
  void loadConfig();

@@ -2,7 +2,7 @@
 #include <SKSE/SKSE.h>
 #include "higgsinterface.h"
 #include "helper.h"
-#include "water_detection.h"
+#include "water_coll_det.h"
 #include <thread>
 #include <atomic>
 #include <string>
