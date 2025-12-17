@@ -70,7 +70,18 @@ namespace InteractiveWaterVR
  float cfgWakeMaxMultiplier =2.0f; // max multiplier applied to cfgWakeAmt
  // Wake movement sound volume (0.0..1.0+)
  float cfgWakeMoveSoundVol =0.8f; // default volume for wake movement sound
- float cfgTrackingLossSplashDelaySeconds = 2.0f; // default 2 seconds
+ float cfgTrackingLossSplashDelaySeconds =2.0f; // default2 seconds
+
+ // Option: automatically unequip fire spells when submerged and flagged
+ bool cfgAutoUnequipFire = true; // default ON
+ // Option: automatically cast shock self spell when submerged and flagged
+ bool cfgAutoCastShock = true; // default ON
+
+ float cfgFrostSpawnForwardOffset =2.5f;
+ float cfgFrostSpawnOffsetX =0.0f;
+ float cfgFrostSpawnOffsetY =0.0f;
+ float cfgFrostSpawnOffsetZ =0.0f;
+ bool cfgSpellInteractionsEnabled = true;
 
  static inline void trim(std::string& s)
  {
@@ -191,7 +202,7 @@ namespace InteractiveWaterVR
  try { logging = std::stoi(value); } catch (...) { }
  } else if (varName == "LeftHandedMode") {
  try { leftHandedMode = std::stoi(value); } catch (...) { }
- }
+ } 
  } else if (currentSection == "Movement") {
  std::string varName;
  auto value = GetConfigSettingsStringValue(line, varName);
@@ -267,6 +278,19 @@ namespace InteractiveWaterVR
  auto value = GetConfigSettingsStringValue(line, varName);
  try {
  if (varName == "TrackingLossSplashDelaySeconds") cfgTrackingLossSplashDelaySeconds = std::stof(value);
+ } catch (...) {
+ }
+ } else if (currentSection == "Spells") {
+ std::string varName;
+ auto value = GetConfigSettingsStringValue(line, varName);
+ try {
+ if (varName == "AutoUnequipFire") cfgAutoUnequipFire = (std::stoi(value) !=0);
+ else if (varName == "AutoCastShock") cfgAutoCastShock = (std::stoi(value) !=0);
+ else if (varName == "FrostSpawnForwardOffset") cfgFrostSpawnForwardOffset = std::stof(value);
+ else if (varName == "FrostSpawnOffsetX") cfgFrostSpawnOffsetX = std::stof(value);
+ else if (varName == "FrostSpawnOffsetY") cfgFrostSpawnOffsetY = std::stof(value);
+ else if (varName == "FrostSpawnOffsetZ") cfgFrostSpawnOffsetZ = std::stof(value);
+ else if (varName == "SpellInteractionsEnabled") cfgSpellInteractionsEnabled = (std::stoi(value) !=0);
  } catch (...) {
  }
  }

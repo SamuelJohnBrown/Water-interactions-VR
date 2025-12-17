@@ -127,7 +127,7 @@ namespace InteractiveWaterVR
  void StartMod()
  {
  // Implement module startup here: install hooks, initialize state, use helper functions.
- IW_LOG_INFO("Interactive_Water_VR: StartMod called");
+ IW_LOG_INFO("Interactive_WATER_VR: StartMod called");
 
  // Prevent duplicate starts
  bool expectedModStarted = false;
@@ -136,16 +136,40 @@ namespace InteractiveWaterVR
  return;
  }
  
- // Defensive readiness checks: ensure player and3D root are available before starting runtime monitoring.
+ // Initialize SetAngle relocation for VM call
+ try {
+ SetAngle = REL::Relocation<_SetAngle>{ REL::VariantID(0,0,0x009D18F0) };
+ IW_LOG_INFO("SetAngle relocation initialized");
+ } catch (...) {
+ IW_LOG_WARN("StartMod: failed to initialize SetAngle relocation");
+ }
+ 
+ // Initialize MoveTo relocation for VM call (VR address)
+ try {
+ MoveTo = REL::Relocation<_MoveTo>{ REL::VariantID(0,0,0x009CF360) };
+ IW_LOG_INFO("MoveTo relocation initialized");
+ } catch (...) {
+ IW_LOG_WARN("StartMod: failed to initialize MoveTo relocation");
+ }
+ 
+ // Initialize Delete relocation for despawning (VR address)
+ try {
+ Delete = REL::Relocation<_Delete>{ REL::VariantID(0,0,0x009CE380) };
+ IW_LOG_INFO("Delete relocation initialized");
+ } catch (...) {
+ IW_LOG_WARN("StartMod: failed to initialize Delete relocation");
+ }
+  
+  // Defensive readiness checks: ensure player and3D root are available before starting runtime monitoring.
  auto player = RE::PlayerCharacter::GetSingleton();
  if (!player) {
- IW_LOG_WARN("StartMod: player singleton not available yet — rescheduling StartMod");
+ IW_LOG_WARN("StartMod: player singleton not available yet ? rescheduling StartMod");
  ScheduleStartMod(1);
  return;
  }
  auto root = player->Get3D();
  if (!root) {
- IW_LOG_WARN("StartMod: player3D root not available yet — rescheduling StartMod");
+ IW_LOG_WARN("StartMod: player3D root not available yet ? rescheduling StartMod");
  ScheduleStartMod(1);
  return;
  }

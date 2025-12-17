@@ -102,4 +102,80 @@ namespace InteractiveWaterVR
  return (static_cast<std::uint32_t>(*loadedIndex) <<24) | (a_baseFormId &0x00FFFFFFu);
  }
 
-}
+ // Define relocation variable for SetAngle and MoveTo
+ REL::Relocation<_SetAngle> SetAngle;
+ REL::Relocation<_MoveTo> MoveTo;
+ REL::Relocation<_Delete> Delete;
+
+ // Implement SetAngleFunc which schedules a task to call the VM function on main thread
+ void SetAngleFunc(RE::TESObjectREFR* akSource, float xAngle, float yAngle, float zAngle)
+ {
+ auto task = SKSE::GetTaskInterface();
+ if (!task) {
+ // Fallback: attempt to call directly (unsafe unless on main thread)
+ auto vm = RE::BSScript::Internal::VirtualMachine::GetSingleton();
+ // Retrieve the function pointer from relocation and check it
+ auto setAngleFn = SetAngle.get();
+ if (vm && setAngleFn) {
+ setAngleFn(vm,0, akSource, xAngle, yAngle, zAngle);
+ }
+ return;
+ }
+
+ // Capture parameters by value and post to main thread
+ task->AddTask([akSource, xAngle, yAngle, zAngle]() {
+ auto vm = RE::BSScript::Internal::VirtualMachine::GetSingleton();
+ auto setAngleFn = SetAngle.get();
+ if (vm && setAngleFn) {
+ setAngleFn(vm,0, akSource, xAngle, yAngle, zAngle);
+ }
+ });
+ }
+
+ // Implement MoveToFunc which schedules a task to call the VM function on main thread
+ void MoveToFunc(RE::TESObjectREFR* akSource, RE::TESObjectREFR* refObj, float xOffset, float yOffset, float zOffset, bool matchRotation)
+ {
+ auto task = SKSE::GetTaskInterface();
+ if (!task) {
+ // Fallback: attempt to call directly (unsafe unless on main thread)
+ auto vm = RE::BSScript::Internal::VirtualMachine::GetSingleton();
+ auto moveToFn = MoveTo.get();
+ if (vm && moveToFn) {
+ moveToFn(vm,0, akSource, refObj, xOffset, yOffset, zOffset, matchRotation);
+ }
+ return;
+ }
+
+ // Capture parameters by value and post to main thread
+ task->AddTask([akSource, refObj, xOffset, yOffset, zOffset, matchRotation]() {
+ auto vm = RE::BSScript::Internal::VirtualMachine::GetSingleton();
+ auto moveToFn = MoveTo.get();
+ if (vm && moveToFn) {
+ moveToFn(vm,0, akSource, refObj, xOffset, yOffset, zOffset, matchRotation);
+ }
+ });
+ }
+
+ void DeleteFunc(RE::TESObjectREFR* obj)
+ {
+ if (!obj) {
+ return;
+ }
+ 
+ auto task = SKSE::GetTaskInterface();
+ auto invoke = [obj]() {
+ auto vm = VM::GetSingleton();
+ auto deleteFn = Delete.get();
+ if (vm && deleteFn) {
+ deleteFn(vm,0, obj);
+ }
+ };
+ 
+ if (task) {
+ task->AddTask(invoke);
+ } else {
+ invoke();
+ }
+ }
+
+ } // namespace InteractiveWaterVR

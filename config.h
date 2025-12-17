@@ -76,7 +76,17 @@ namespace InteractiveWaterVR
  // Tracking loss splash delay
  extern float cfgTrackingLossSplashDelaySeconds; // delay before splash when tracking is lost
 
- // Load configuration from Data\\SKSE\\Plugins\\Interactive_Water_VR.ini
+ // Option: automatically unequip fire spells when submerged and flagged
+ extern bool cfgAutoUnequipFire;
+ // Option: automatically cast shock self spell when submerged and flagged
+ extern bool cfgAutoCastShock;
+ extern float cfgFrostSpawnForwardOffset;
+ extern float cfgFrostSpawnOffsetX;
+ extern float cfgFrostSpawnOffsetY;
+ extern float cfgFrostSpawnOffsetZ;
+ extern bool cfgSpellInteractionsEnabled;
+
+ // Load configuration from Data\SKSE\Plugins\Interactive_Water_VR.ini
  void loadConfig();
 
  // Simple logging helper (keeps compatibility with old LOG macros)

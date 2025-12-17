@@ -45,7 +45,6 @@ static void OnSKSEMessage(SKSE::MessagingInterface::Message* msg)
 			// Cache interface for later use
 			HiggsPluginAPI::g_higgsInterface = higgs;
 			unsigned long build = higgs->GetBuildNumber();
-			// Log to SKSE log with fmt-style and to plugin log with printf-style to ensure both receive the build number
 			SKSE::log::info("Interactive_Water_VR: obtained HIGGS interface, build {}", build);
 			InteractiveWaterVR::AppendToPluginLog("INFO", "Interactive_Water_VR: obtained HIGGS interface, build %lu", build);
 			IW_LOG_INFO("Interactive_Water_VR: obtained HIGGS interface");
@@ -53,18 +52,27 @@ static void OnSKSEMessage(SKSE::MessagingInterface::Message* msg)
 			SKSE::log::info("Interactive_Water_VR: HIGGS interface not available on PostPostLoad");
 			IW_LOG_WARN("Interactive_Water_VR: HIGGS interface not available on PostPostLoad");
 		}
+		// Ensure module start is scheduled after PostPostLoad in case it wasn't started earlier
+		InteractiveWaterVR::ScheduleStartMod(2);
+
+		// End any load suspension and ensure monitoring is running. MonitoringThread will wait for player/root if needed.
+		InteractiveWaterVR::NotifyGameLoadEnd();
+		InteractiveWaterVR::StartWaterMonitoring();
 		break;
 	}
 	case SKSE::MessagingInterface::kDataLoaded: {
-		// Game data has been loaded; check for ESP presence (still not "in world")
 		IW_LOG_INFO("Interactive_Water_VR: received kDataLoaded message");
 		InteractiveWaterVR::LogSpellInteractionsVRLoaded();
+		// Schedule a module start attempt after data is available
+		InteractiveWaterVR::ScheduleStartMod(2);
+
+		// Ensure any load suspension is cleared and monitoring is running
+		InteractiveWaterVR::NotifyGameLoadEnd();
+		InteractiveWaterVR::StartWaterMonitoring();
 		break;
 	}
 	case SKSE::MessagingInterface::kPreLoadGame: {
-		// A save is about to be loaded - stop runtime monitoring to avoid detecting during load transition
 		IW_LOG_INFO("Interactive_Water_VR: received kPreLoadGame - stopping monitoring");
-		// Log whether monitoring was active before this load (helps diagnose CTDs when loading from an existing session)
 		if (InteractiveWaterVR::IsMonitoringActive()) {
 			InteractiveWaterVR::AppendToPluginLog("INFO", "PreLoadGame: monitoring active - will stop before loading save");
 		} else {
@@ -77,35 +85,28 @@ static void OnSKSEMessage(SKSE::MessagingInterface::Message* msg)
 		// Cancel any pending scheduled starts to avoid StartMod firing mid-load
 		InteractiveWaterVR::CancelScheduledStartMod();
 
-		// Log key engine pointers (main thread) to help debug transient nulls causing CTDs
-		auto player = RE::PlayerCharacter::GetSingleton();
-		if (player) {
-			auto root = player->Get3D();
-			InteractiveWaterVR::AppendToPluginLog("INFO", "PreLoadGame: player=%p, root=%p", static_cast<void*>(player), static_cast<void*>(root));
-			#if defined(ENABLE_SKYRIM_VR)
-			if (root) {
-				auto leftNode = root->GetObjectByName("NPC L Hand [LHnd]");
-				auto rightNode = root->GetObjectByName("NPC R Hand [RHnd]");
-				InteractiveWaterVR::AppendToPluginLog("INFO", "PreLoadGame: leftNode=%p rightNode=%p", static_cast<void*>(leftNode), static_cast<void*>(rightNode));
-			}
-			#endif
-		} else {
-			InteractiveWaterVR::AppendToPluginLog("INFO", "PreLoadGame: player singleton is null");
-		}
+		// Stop monitoring to avoid detecting during load transition
 		InteractiveWaterVR::StopWaterMonitoring();
 		break;
 	}
 	case SKSE::MessagingInterface::kPostLoadGame: {
-		// Save finished loading and player should be in-world -> schedule module/runtime logic after short delay
 		IW_LOG_INFO("Interactive_Water_VR: received kPostLoadGame - scheduling module start");
 		InteractiveWaterVR::AppendToPluginLog("INFO", "PostLoadGame: scheduling StartMod (from load event)");
+		InteractiveWaterVR::ScheduleStartMod(2);
 
-		InteractiveWaterVR::ScheduleStartMod(2); //5 second delay before starting water detection
+		// End the load suspension and ensure monitoring is running
+		InteractiveWaterVR::NotifyGameLoadEnd();
+		InteractiveWaterVR::StartWaterMonitoring();
 		break;
 	}
 	case SKSE::MessagingInterface::kNewGame: {
-		// New game started (fresh world) -> do NOT start water monitoring; just log.
-		IW_LOG_INFO("Interactive_Water_VR: received kNewGame - new game detected; not starting water monitoring");
+		IW_LOG_INFO("Interactive_Water_VR: received kNewGame - new game detected; scheduling module start");
+		InteractiveWaterVR::AppendToPluginLog("INFO", "NewGame: scheduling StartMod (from NewGame event)");
+		InteractiveWaterVR::ScheduleStartMod(2);
+
+		// Clear any load suspension and start monitoring
+		InteractiveWaterVR::NotifyGameLoadEnd();
+		InteractiveWaterVR::StartWaterMonitoring();
 		break;
 	}
 	default:
@@ -147,14 +148,11 @@ extern "C" __declspec(dllexport) bool SKSEPlugin_Load(const SKSE::LoadInterface*
 				trampoline.create(TrampolineSize);
 			}
 
-			// Wire the global trampoline pointer so other modules can reference it
 			InteractiveWaterVR::g_trampoline = &trampoline;
 
-			// Confirmation logging
 			SKSE::log::info("Interactive_Water_VR: trampoline created (capacity = {} bytes)", trampoline.capacity());
 			IW_LOG_INFO("Interactive_Water_VR: trampoline created");
 
-			// Register listener for SKSE messages so we can fetch HIGGS on PostPostLoad and detect DataLoaded / load events
 			auto messaging = SKSE::GetMessagingInterface();
 			if (messaging) {
 				bool reg = messaging->RegisterListener("SKSE", OnSKSEMessage);
@@ -177,6 +175,14 @@ extern "C" __declspec(dllexport) bool SKSEPlugin_Load(const SKSE::LoadInterface*
 			IW_LOG_ERROR("Interactive_Water_VR: trampoline creation failed");
 		}
 	});
+
+	// As a final attempt, schedule StartMod in case messages aren't delivered in some scenarios.
+	IW_LOG_INFO("Interactive_Water_VR: scheduling StartMod from SKSEPlugin_Load");
+	InteractiveWaterVR::ScheduleStartMod(2);
+
+	// Also attempt to ensure monitoring is running as a final fallback
+	InteractiveWaterVR::NotifyGameLoadEnd();
+	InteractiveWaterVR::StartWaterMonitoring();
 
 	return true;
 }

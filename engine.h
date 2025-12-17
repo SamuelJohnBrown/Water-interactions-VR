@@ -15,7 +15,7 @@ namespace InteractiveWaterVR
  void StartMod();
 
  // Schedule StartMod to run after a delay (seconds). Safe to call multiple times; only one scheduled start will run.
- void ScheduleStartMod(int delaySeconds =5);
+ void ScheduleStartMod(int delaySeconds =2);
 
  // Cancel any pending scheduled StartMod and reset internal start state.
  void CancelScheduledStartMod();

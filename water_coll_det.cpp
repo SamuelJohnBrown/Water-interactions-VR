@@ -1,6 +1,7 @@
 #include "water_coll_det.h"
 #include "helper.h"
 #include "config.h"
+#include "equipped_spell_interaction.h"
 #include <thread>
 #include <chrono>
 #include <atomic>
@@ -10,6 +11,9 @@
 #include <algorithm>
 #include <functional>
 #include <deque>
+#include <string>
+#include <vector>
+#include <cstdio>
 
 #ifndef NOMINMAX
 #define NOMINMAX
@@ -28,6 +32,50 @@ static std::thread s_thread;
 static std::atomic<bool> s_prevLeftMoving{false};
 static std::atomic<bool> s_prevRightMoving{false};
 
+// Previous per-hand submerged-with-spell logging flags
+static std::atomic<bool> s_prevLeftSubmergedWithSpell{false};
+static std::atomic<bool> s_prevRightSubmergedWithSpell{false};
+
+// Global flags for MagicDamage keyword types (default false)
+// These are declared extern in header and defined here for external visibility
+std::atomic<bool> InteractiveWaterVR::s_submergedMagicDamageFire{false};
+std::atomic<bool> InteractiveWaterVR::s_submergedMagicDamageShock{false};
+std::atomic<bool> InteractiveWaterVR::s_submergedMagicDamageFrost{false};
+
+// Per-hand fire-submerged flags (declared extern in header)
+std::atomic<bool> InteractiveWaterVR::s_submergedMagicDamageFireLeft{false};
+std::atomic<bool> InteractiveWaterVR::s_submergedMagicDamageFireRight{false};
+
+// Per-hand frost-submerged flags (declared extern in header)
+std::atomic<bool> InteractiveWaterVR::s_submergedMagicDamageFrostLeft{false};
+std::atomic<bool> InteractiveWaterVR::s_submergedMagicDamageFrostRight{false};
+
+// Per-controller movement state exposed for sound logic (updated by monitoring thread)
+static std::atomic<bool> s_leftIsMoving{false};
+static std::atomic<bool> s_rightIsMoving{false};
+
+// Suppress sounds for a controller when player is sneaking and controller submerged >=2.0 m
+static std::atomic<bool> s_leftSuppressDueToSneakDepth{false};
+static std::atomic<bool> s_rightSuppressDueToSneakDepth{false};
+
+// Helper: check whether a spell contains a given keyword editorID on any of its effect settings
+static bool SpellHasKeyword(RE::MagicItem* spell, std::string_view editorID)
+{
+ if (!spell) return false;
+ for (auto eff : spell->effects) {
+ if (!eff) continue;
+ auto base = eff->baseEffect; // EffectSetting*
+ if (!base) continue;
+ for (auto kw : base->GetKeywords()) {
+ if (!kw) continue;
+ if (kw->formEditorID.contains(editorID)) return true;
+ const char* id = kw->formEditorID.c_str();
+ if (id && editorID == id) return true;
+ }
+ }
+ return false;
+}
+
 // Per-controller ripple emission state
 static std::atomic<bool> s_leftRippleEmitted{false};
 static std::atomic<bool> s_rightRippleEmitted{false};
@@ -41,6 +89,11 @@ static std::atomic<long long> s_rightLastWakeMs{0};
 // Per-controller last entry-splash sound start time (ms since epoch)
 static std::atomic<long long> s_leftLastEntrySoundMs{0};
 static std::atomic<long long> s_rightLastEntrySoundMs{0};
+// Track whether an entry splash sound instance is considered 'playing' (used to suppress exit sounds)
+static std::atomic<bool> s_leftEntrySoundPlaying{false};
+static std::atomic<bool> s_rightEntrySoundPlaying{false};
+// Conservative timeout (ms) used to clear the playing flag if we can't query the sound handle
+constexpr int kEntrySoundPlayingTimeoutMs =2000;
 // Window (ms) during which an exit sound must be suppressed if an entry sound just played
 constexpr long long kEntrySoundGuardMs =1500;
 // Wake-move sound played once when hand starts moving underwater after delay
@@ -59,17 +112,21 @@ constexpr float kMaxExitUpSpeed =900.0f; // ignore exit impacts faster than this
 constexpr int kPollIntervalMs =6;
 
 // Movement detection thresholds (m/s)
-constexpr float kStationaryThreshold =0.02f; // below => consider stationary (instant threshold)
-constexpr float kMovingThreshold =0.05f; // above => consider moving (instant)
-constexpr float kJitterThreshold =0.01f; // tiny jitter to update last movement time
-constexpr float kMaxValidSpeed =50.0f; // ignore implausible spikes
-constexpr float kStationaryConfirmSeconds =2.0f; // require this much time without movement to mark stationary
+constexpr float kStationaryThreshold =1.0f; // below => consider stationary (instant threshold)
+constexpr float kMovingThreshold =0.1f; // above => consider moving (instant)
+constexpr float kJitterThreshold =0.03f; // tiny jitter to update last movement time
+constexpr float kMaxValidSpeed =60.0f; // ignore implausible spikes
+constexpr float kStationaryConfirmSeconds =1.5f; // require this much time without movement to mark stationary
 
 // Flag set while a game load is in progress to avoid using engine objects.
 static std::atomic<bool> s_gameLoadInProgress{false};
 
 // Persist player swimming state for transition logging
 static std::atomic<bool> s_prevPlayerSwimming{false};
+// Persist player sneaking state for transition logging
+static std::atomic<bool> s_prevPlayerSneaking{false};
+// Track whether suspension is active specifically due to depth+sneak rule
+static std::atomic<bool> s_suspendDueToDepthSneak{false};
 
 // Player depth logging state
 static std::atomic<long long> s_lastPlayerDepthLogMs{0};
@@ -77,9 +134,30 @@ static std::atomic<float> s_prevPlayerDepth{0.0f};
 constexpr long long kPlayerDepthLogIntervalMs =1000; // log at most once per second (or on significant change)
 constexpr float kPlayerDepthLogDelta =0.05f; // meters change to force log
 
+// Player depth (meters) threshold to suspend all water detection when at or below this depth
+constexpr float kPlayerDepthShutdownMeters =70.0f;
+// Minimum player depth (meters) required before running spell unequip monitor
+constexpr float kSpellMonitorMinDepth =1.0f;
+
 // Per-controller last measured depth (meters) when submerged
 static std::atomic<float> s_leftControllerDepth{0.0f};
 static std::atomic<float> s_rightControllerDepth{0.0f};
+
+// Frost spawn water height (world Z) used by spell_interaction when spawning movables
+std::atomic<float> InteractiveWaterVR::s_frostSpawnWaterHeight{0.0f};
+
+// Controller world XY positions (meters) updated each poll
+std::atomic<float> InteractiveWaterVR::s_leftControllerWorldX{0.0f};
+std::atomic<float> InteractiveWaterVR::s_leftControllerWorldY{0.0f};
+std::atomic<float> InteractiveWaterVR::s_rightControllerWorldX{0.0f};
+std::atomic<float> InteractiveWaterVR::s_rightControllerWorldY{0.0f};
+
+// Flag to suspend all water detections (used to prevent scheduled main-thread tasks from emitting while suspended)
+ static std::atomic<bool> s_suspendAllDetections{false};
+
+// Controller-specific detection active flags
+static std::atomic<bool> s_leftDetectionActive{true};
+static std::atomic<bool> s_rightDetectionActive{true};
 
 // Notify functions
 void NotifyGameLoadStart() { s_gameLoadInProgress.store(true); }
@@ -111,7 +189,12 @@ std::chrono::steady_clock::time_point rightMovementCandidateTime{};
  // Window (ms) after transition during which a forced ripple is allowed
  constexpr long long kForcedRippleWindowMs =250;
 
-// Movement thresholds are configurable via Data\SKSE\Plugins\Interactive_Water_VR.ini (see src/config.cpp)
+ // Minimum controller submerged depth (meters) required to spawn wake ripples
+ constexpr float kMinWakeDepthMeters =2.0f;
+ // Frost logic tolerance: controller must remain within this depth of the surface to be considered "surface frost"
+ constexpr float kFrostSurfaceDepthTolerance =6.0f;
+
+ // Movement thresholds are configurable via Data\SKSE\Plugins\Interactive_Water_VR.ini (see src/config.cpp)
 
 static RE::NiAVObject* GetPlayerHandNode(bool rightHand) {
 	auto player = RE::PlayerCharacter::GetSingleton();
@@ -214,7 +297,7 @@ enum class SplashBand {
 
 // Map user-provided base form IDs (from SpellInteractionsVR.esp) to bands
 static const std::uint32_t kSplashFormBaseIDs[static_cast<size_t>(SplashBand::Count)] = {
-	0x01000806u, // VeryLight (user provided0X1000806)
+	0x01000819u, // VeryLight (user provided0X1000806)
 	0x01000806u, // Light (same in user's mapping)
 	0x01000807u, // Normal/Medium
 	0x01000808u, // Hard/Large
@@ -223,6 +306,10 @@ static const std::uint32_t kSplashFormBaseIDs[static_cast<size_t>(SplashBand::Co
 
 // Cache loaded descriptors to avoid repeated lookups
 static RE::BGSSoundDescriptorForm* s_splashSounds[static_cast<size_t>(SplashBand::Count)] = {nullptr};
+
+// Frost spawn form cache and base id
+static RE::BGSMovableStatic* s_frostSpawnForm = nullptr;
+static const std::uint32_t kFrostSpawnFormBaseId =0x01000816u;
 
 static RE::BGSSoundDescriptorForm* LoadSplashSoundDescriptor(SplashBand band) {
 	auto idx = static_cast<size_t>(band);
@@ -249,6 +336,8 @@ static SplashBand GetSplashBandForDownSpeed(float downSpeed) {
 static uint32_t PlaySoundAtNode(RE::BGSSoundDescriptorForm* sound, RE::NiAVObject* node, const RE::NiPoint3& location, float volume)
 {
 	if (!sound) return 0;
+	// Respect global suspension flag
+	if (s_suspendAllDetections.load()) return 0;
 	auto audio = RE::BSAudioManager::GetSingleton();
 	if (!audio) return 0;
 
@@ -273,57 +362,17 @@ static uint32_t PlaySoundAtNode(RE::BGSSoundDescriptorForm* sound, RE::NiAVObjec
 	return 0;
 }
 
-static void PlaySplashSoundForDownSpeed(bool isLeft, float downSpeed) {
-	// Choose band
-	SplashBand band = GetSplashBandForDownSpeed(downSpeed);
-	auto desc = LoadSplashSoundDescriptor(band);
-	if (!desc) return;
-	// Get hand node for appropriate hand
-	auto node = GetPlayerHandNode(!isLeft ? true : false); // left: false, right: true
-	if (!node) {
-		return;
-	}
-
-	// If the controller is already submerged and this is NOT an immediate entry event, suppress sounds.
-	// Allow entry sounds only if the last transition for this hand was an 'inWater' within the forced window.
-	long long lastTrans = isLeft ? lastLeftTransitionMs.load() : lastRightTransitionMs.load();
-	bool justEntered = false;
-	if (lastTrans !=0) {
-		long long nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
-		if ((nowMs - lastTrans) <= kForcedRippleWindowMs) justEntered = true;
-	}
-	if (!justEntered) {
-		// if currently submerged, suppress any splash sounds (this prevents sounds while moving underwater)
-		if ((isLeft && leftSubmerged.load()) || (!isLeft && rightSubmerged.load())) {
-			return;
-		}
-	}
-
-	// select volume based on band and config
-	float vol =1.0f;
-	switch (band) {
-		case SplashBand::VeryLight: vol = cfgSplashVeryLightVol; break;
-		case SplashBand::Light: vol = cfgSplashLightVol; break;
-		case SplashBand::Normal: vol = cfgSplashNormalVol; break;
-		case SplashBand::Hard: vol = cfgSplashHardVol; break;
-		case SplashBand::VeryHard: vol = cfgSplashVeryHardVol; break;
-		default: vol =1.0f; break;
-	}
-	// clamp to non-negative
-	if (vol <0.0f) vol =0.0f;
-
-	uint32_t id = PlaySoundAtNode(desc, node, node->world.translate, vol);
-	if (id == 0) {
-	} else {
-		// record entry-sound start time so exit sounds can be suppressed while this plays
-		long long nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
-		if (isLeft) s_leftLastEntrySoundMs.store(nowMs);
-		else s_rightLastEntrySoundMs.store(nowMs);
-	}
-}
-
 // Helper that runs on main thread (or fallback) to add ripple (audio intentionally removed)
 static void EmitRipple(const RE::NiPoint3& p, float amt, const char* reason = nullptr, const char* hand = "?") {
+	// If globally suspended, don't emit
+	if (s_suspendAllDetections.load()) return;
+
+	// If frost-submerged flag is active, previously we spawned a movable static. Spawn logic removed — keep flag available for future use.
+	if (InteractiveWaterVR::s_submergedMagicDamageFrost.load()) {
+		IW_LOG_INFO("EmitRipple: MagicDamageFrost flag is active — spawn logic disabled and reserved for future use");
+		// Intentionally do not spawn or place objects here. The boolean remains available for other systems to act on.
+	}
+
 	// Only emit ripple; audio intentionally removed
 	auto ws = RE::TESWaterSystem::GetSingleton();
 	if (ws) {
@@ -346,7 +395,7 @@ static bool EmitRippleIfAllowed(bool isLeft, const RE::NiPoint3& p, float amt, b
  	 	 } else {
  	 	 	 long long t = lastRightTransitionMs.load();
  	 	 	 if (nowMs - t > kForcedRippleWindowMs) {
- 	 	 	 	 force = false;
+ 	 	 	  	 force = false;
  	 	 	 }
  	 	 }
  	 }
@@ -382,13 +431,13 @@ static bool EmitRippleIfAllowed(bool isLeft, const RE::NiPoint3& p, float amt, b
 	 return EmitRippleIfAllowed(isLeft, p, amt, force, requireSubmergedState, reason);
  }
 
-// --- Exit sound support ---
-// Map exit-band form IDs: default for exits is0x01000810, except hard/very hard use0x0100080E
+ // --- Exit sound support ---
+ // Map exit-band form IDs: default for exits is0x01000810, except hard/very hard use0x0100080E
  static const std::uint32_t kSplashExitFormBaseIDs[static_cast<size_t>(SplashBand::Count)] = {
 0x01000810u, // VeryLight
-0x01000810u, // Light
-0x01000810u, // Normal
-0x0100080Eu, // Hard
+0x0100081Au, // Light
+0x0100081Bu, // Normal
+0x0100080Cu, // Hard
 0x0100080Eu // VeryHard
  };
  
@@ -419,12 +468,17 @@ static bool EmitRippleIfAllowed(bool isLeft, const RE::NiPoint3& p, float amt, b
  }
 
  static void PlayExitSoundForUpSpeed(bool isLeft, float upSpeed) {
- SplashBand band = GetExitSplashBandForUpSpeed(upSpeed);
- auto desc = LoadSplashExitSoundDescriptor(band);
- if (!desc) return;
- auto node = GetPlayerHandNode(isLeft ? false : true);
- if (!node) return;
- float vol =0.2f;
+	if (s_suspendAllDetections.load()) return;
+	// If an entry splash instance is currently playing for this hand, never play exit sound
+	if ((isLeft && s_leftEntrySoundPlaying.load()) || (!isLeft && s_rightEntrySoundPlaying.load())) {
+		return;
+	}
+	SplashBand band = GetExitSplashBandForUpSpeed(upSpeed);
+	auto desc = LoadSplashExitSoundDescriptor(band);
+	if (!desc) return;
+	auto node = GetPlayerHandNode(isLeft ? false : true);
+	if (!node) return;
+	float vol =0.2f;
  switch (band) {
  case SplashBand::VeryLight: vol = cfgSplashExitVeryLightVol; break;
  case SplashBand::Light: vol = cfgSplashExitLightVol; break;
@@ -456,27 +510,30 @@ static bool EmitRippleIfAllowed(bool isLeft, const RE::NiPoint3& p, float amt, b
 
 // Definition: attempt to play the wake-move sound (once per submerged session)
 static bool TryPlayWakeMoveSound(bool isLeft) {
- // Load descriptor if needed
- if (!s_wakeMoveSoundDesc) {
- std::uint32_t fullId =0;
- auto form = LoadFormAndLog<RE::BGSSoundDescriptorForm>("SpellInteractionsVR.esp", fullId,0x01000809u, "WakeMoveSound");
- if (!form) {
- IW_LOG_WARN("TryPlayWakeMoveSound: failed to load wake-move sound form (base0x01000809)");
- return false;
- }
- s_wakeMoveSoundDesc = form;
- IW_LOG_INFO("TryPlayWakeMoveSound: loaded wake-move sound form -> fullId=0x%08X", fullId);
- }
+	if (s_suspendAllDetections.load()) return false;
+	// Load descriptor if needed
+	if (!s_wakeMoveSoundDesc) {
+		std::uint32_t fullId =0;
+		auto form = LoadFormAndLog<RE::BGSSoundDescriptorForm>("SpellInteractionsVR.esp", fullId,0x01000809u, "WakeMoveSound");
+		if (!form) {
+			IW_LOG_WARN("TryPlayWakeMoveSound: failed to load wake-move sound form (base0x01000809)");
+			return false;
+		}
+		s_wakeMoveSoundDesc = form;
+		IW_LOG_INFO("TryPlayWakeMoveSound: loaded wake-move sound form -> fullId=0x%08X", fullId);
+	}
 
- // NOTE: per request, this sound is immune to guards. Play whenever called and hand node exists.
- auto node = GetPlayerHandNode(isLeft ? false : true);
- if (!node) return false;
+	// NOTE: per request, this sound is immune to guards. But respect global suspension.
+	if (s_suspendAllDetections.load()) return false;
+	// NOTE: per request, this sound is immune to guards. Play whenever called and hand node exists.
+	auto node = GetPlayerHandNode(isLeft ? false : true);
+	if (!node) return false;
 
- float vol = cfgWakeMoveSoundVol;
- uint32_t id = PlaySoundAtNode(s_wakeMoveSoundDesc, node, node->world.translate, vol);
- if (id ==0) return false;
+	float vol = cfgWakeMoveSoundVol;
+	uint32_t id = PlaySoundAtNode(s_wakeMoveSoundDesc, node, node->world.translate, vol);
+	if (id ==0) return false;
 
- // store handle id for potential later stop/cleanup on exit
+	// store handle id for potential later stop/cleanup on exit
  if (isLeft) s_leftWakeMoveSoundHandle.store(id);
  else s_rightWakeMoveSoundHandle.store(id);
 
@@ -533,6 +590,8 @@ static void LogWaterDetailsAtPosition(const RE::NiPoint3& a_pos) {
 static void EmitWakeRipple(bool isLeft, const RE::NiPoint3& p, float amt);
 // forward declaration for wake-move sound helper
 static bool TryPlayWakeMoveSound(bool isLeft);
+// forward declaration for splash sound helper
+static void PlaySplashSoundForDownSpeed(bool isLeft, float downSpeed, bool requireMoving = true);
 
 void MonitoringThread() {
 	// call loadConfig initially
@@ -544,6 +603,11 @@ void MonitoringThread() {
 
 	bool lastLeftInWater = false;
 	bool lastRightInWater = false;
+
+ // local prev-moving flags used to auto-toggle per-controller detection
+ bool prevLeftMovingLocal = false;
+ bool prevRightMovingLocal = false;
+ bool spellMonitorActive = false;
 
 	RE::NiPoint3 prevLeftPos{0.0f,0.0f,0.0f};
 	RE::NiPoint3 prevRightPos{0.0f,0.0f,0.0f};
@@ -625,22 +689,169 @@ std::deque<Sample> playerSamples; // samples for player speed estimation
 			
 			// proceed with controller sampling
 
-			auto leftPos = GetControllerWorldPosition(false);
-			auto rightPos = GetControllerWorldPosition(true);
+			auto leftNode = GetPlayerHandNode(false);
+			auto rightNode = GetPlayerHandNode(true);
+
+			// If a hand node is missing (tracking lost), disable detection for that hand and clear buffers
+			if (!leftNode) {
+				if (s_leftDetectionActive.load()) {
+					s_leftDetectionActive.store(false);
+				}
+				leftSamples.clear();
+				havePrevLeft = false;
+			}
+			if (!rightNode) {
+				if (s_rightDetectionActive.load()) {
+				 s_rightDetectionActive.store(false);
+				}
+				rightSamples.clear();
+				havePrevRight = false;
+			}
+
+			auto leftPos = leftNode ? leftNode->world.translate : RE::NiPoint3{0.0f,0.0f,0.0f};
+			auto rightPos = rightNode ? rightNode->world.translate : RE::NiPoint3{0.0f,0.0f,0.0f};
+			InteractiveWaterVR::s_leftControllerWorldX.store(leftNode ? leftPos.x : 0.0f);
+			InteractiveWaterVR::s_leftControllerWorldY.store(leftNode ? leftPos.y : 0.0f);
+			InteractiveWaterVR::s_rightControllerWorldX.store(rightNode ? rightPos.x : 0.0f);
+			InteractiveWaterVR::s_rightControllerWorldY.store(rightNode ? rightPos.y : 0.0f);
+
 			// capture player position early for sampling and later use
-	auto playerPos = root->world.translate;
+			auto playerPos = root->world.translate;
+
+			// Compute current sneaking state and log transitions
+			bool curSneaking = false;
+			if (player) {
+				curSneaking = player->IsSneaking();
+				bool prevSneak = s_prevPlayerSneaking.load();
+				if (curSneaking != prevSneak) {
+					s_prevPlayerSneaking.store(curSneaking);
+					if (curSneaking) IW_LOG_INFO("Player started sneaking");
+					else IW_LOG_INFO("Player stopped sneaking");
+				}
+			}
+
+			// Determine player depth (relative to water surface). Zero when not in water.
+			float playerDepth =0.0f;
+			{
+				float wh =0.0f;
+				if (IsPointInWater(playerPos, wh)) {
+					playerDepth = wh - playerPos.z;
+					if (playerDepth <0.0f) playerDepth =0.0f;
+				}
+			}
+
+			// Start/stop spell monitor based on player depth relative to surface
+			bool shouldSpellMonitorRun = playerDepth >= kSpellMonitorMinDepth;
+			if (shouldSpellMonitorRun && !spellMonitorActive) {
+				StartSpellUnequipMonitor();
+				spellMonitorActive = true;
+			} else if (!shouldSpellMonitorRun && spellMonitorActive) {
+				StopSpellUnequipMonitor();
+				spellMonitorActive = false;
+			}
+
+			// Primary deep-water shutdown (>= kPlayerDepthShutdownMeters)
+			if (playerDepth >= kPlayerDepthShutdownMeters) {
+				if (!s_suspendAllDetections.load()) {
+					// mark that this suspension is NOT the sneak-depth suspension
+				 s_suspendDueToDepthSneak.store(false);
+				 s_suspendAllDetections.store(true);
+				 // clear state similar to the player-speed shutdown to avoid spurious emissions
+				 leftSubmerged.store(false);
+				 rightSubmerged.store(false);
+				 lastLeftTransitionMs.store(0);
+				 lastRightTransitionMs.store(0);
+				 leftSubmergedStartMs.store(0);
+				 rightSubmergedStartMs.store(0);
+
+				 s_leftRippleEmitted.store(false);
+				 s_rightRippleEmitted.store(false);
+				 s_prevLeftMoving.store(false);
+				 s_prevRightMoving.store(false);
+
+				 leftSamples.clear();
+				 rightSamples.clear();
+				 playerSamples.clear();
+				 havePrevLeft = false;
+				 havePrevRight = false;
+
+				 lastLeftInWater = false;
+				 lastRightInWater = false;
+
+				 s_leftLastRippleTime = std::chrono::steady_clock::time_point{};
+				 s_rightLastRippleTime = std::chrono::steady_clock::time_point{};
+				}
+				std::this_thread::sleep_for(std::chrono::milliseconds(kPollIntervalMs));
+				continue;
+			}
+
+			// If monitoring was suspended due to the primary deep shutdown and player is now shallower, resume
+			if (s_suspendAllDetections.load() && playerDepth < kPlayerDepthShutdownMeters && !s_suspendDueToDepthSneak.load()) {
+				// resume detections
+				s_suspendAllDetections.store(false);
+				// reset recent timers so emissions don't fire immediately
+				s_leftLastRippleTime = std::chrono::steady_clock::time_point{};
+				s_rightLastRippleTime = std::chrono::steady_clock::time_point{};
+			}
+
+			// Additional suppression: if player is50m or deeper AND sneaking, suspend detections (but only via this rule)
+			constexpr float kPlayerDepthSneakShutdownMeters =50.0f;
+			if (playerDepth >= kPlayerDepthSneakShutdownMeters && curSneaking) {
+				if (!s_suspendAllDetections.load()) {
+					// suspend due to depth+sneak
+					s_suspendAllDetections.store(true);
+				 s_suspendDueToDepthSneak.store(true);
+				 // clear state similar to other shutdowns
+				 leftSubmerged.store(false);
+				 rightSubmerged.store(false);
+				 lastLeftTransitionMs.store(0);
+				 lastRightTransitionMs.store(0);
+				 leftSubmergedStartMs.store(0);
+				 rightSubmergedStartMs.store(0);
+
+				 s_leftRippleEmitted.store(false);
+				 s_rightRippleEmitted.store(false);
+				 s_prevLeftMoving.store(false);
+				 s_prevRightMoving.store(false);
+
+				 leftSamples.clear();
+				 rightSamples.clear();
+				 playerSamples.clear();
+				 havePrevLeft = false;
+				 havePrevRight = false;
+
+				 lastLeftInWater = false;
+				 lastRightInWater = false;
+
+				 s_leftLastRippleTime = std::chrono::steady_clock::time_point{};
+				 s_rightLastRippleTime = std::chrono::steady_clock::time_point{};
+				}
+				std::this_thread::sleep_for(std::chrono::milliseconds(kPollIntervalMs));
+				continue;
+			}
+
+			// If suspension was specifically due to depth+sneak and player stops sneaking or rises above the sneak-depth, resume.
+			if (s_suspendDueToDepthSneak.load() && (playerDepth < kPlayerDepthSneakShutdownMeters || !curSneaking)) {
+				// clear the depth+sneak-specific flag
+				s_suspendDueToDepthSneak.store(false);
+				// resume overall detections only if no other global-suspension condition applies
+				// (we keep this simple: clear the global suspension and reset timers)
+				s_suspendAllDetections.store(false);
+			 s_leftLastRippleTime = std::chrono::steady_clock::time_point{};
+			 s_rightLastRippleTime = std::chrono::steady_clock::time_point{};
+			}
 
 			// capture forward directions and timestamp, push into ring buffers for velocity estimation
-			RE::NiPoint3 leftForward = GetControllerForward(false);
-			RE::NiPoint3 rightForward = GetControllerForward(true);
-			auto sampleTime = std::chrono::steady_clock::now();
-			leftSamples.push_back(Sample{leftPos, leftForward, sampleTime});
-			rightSamples.push_back(Sample{rightPos, rightForward, sampleTime});
-			playerSamples.push_back(Sample{playerPos, RE::NiPoint3{0.0f,0.0f,0.0f}, sampleTime});
-			constexpr size_t kMaxSamples =7;
-			if (leftSamples.size() > kMaxSamples) leftSamples.pop_front();
-			if (rightSamples.size() > kMaxSamples) rightSamples.pop_front();
-			if (playerSamples.size() > kMaxSamples) playerSamples.pop_front();
+ RE::NiPoint3 leftForward = GetControllerForward(false);
+ RE::NiPoint3 rightForward = GetControllerForward(true);
+ auto sampleTime = std::chrono::steady_clock::now();
+ leftSamples.push_back(Sample{leftPos, leftForward, sampleTime});
+ rightSamples.push_back(Sample{rightPos, rightForward, sampleTime});
+ playerSamples.push_back(Sample{playerPos, RE::NiPoint3{0.0f,0.0f,0.0f}, sampleTime});
+ constexpr size_t kMaxSamples =7;
+ if (leftSamples.size() > kMaxSamples) leftSamples.pop_front();
+ if (rightSamples.size() > kMaxSamples) rightSamples.pop_front();
+ if (playerSamples.size() > kMaxSamples) playerSamples.pop_front();
 
 			// compute player speed from last two player samples
 			if (playerSamples.size() >=2) {
@@ -653,8 +864,8 @@ std::deque<Sample> playerSamples; // samples for player speed estimation
 					float dz = sCur.pos.z - sPrev.pos.z;
 					recentPlayerSpeed = std::sqrt(dx * dx + dy * dy + dz * dz) / (float)ds;
 					// rate-limited logging
-					long long nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
-					if ((nowMs - lastPlayerSpeedLogMs) >= kPlayerSpeedLogIntervalMs || std::fabs(recentPlayerSpeed - prevLoggedPlayerSpeed) >= kPlayerSpeedLogDelta) {
+				 long long nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+				 if ((nowMs - lastPlayerSpeedLogMs) >= kPlayerSpeedLogIntervalMs || std::fabs(recentPlayerSpeed - prevLoggedPlayerSpeed) >= kPlayerSpeedLogDelta) {
 						// Replace verbose player speed logs with water data collection/summaries
 						prevLoggedPlayerSpeed = recentPlayerSpeed;
 						lastPlayerSpeedLogMs = nowMs;
@@ -695,14 +906,14 @@ std::deque<Sample> playerSamples; // samples for player speed estimation
 						rightSamples.clear();
 						playerSamples.clear();
 						havePrevLeft = false;
-						havePrevRight = false;
+					 havePrevRight = false;
 
 						// Reset previous-in-water flags so any pending entry/exit logic is abandoned
-						lastLeftInWater = false;
-						lastRightInWater = false;
+					 lastLeftInWater = false;
+					 lastRightInWater = false;
 
 						// Reset recent timers to avoid immediate emissions when player slows
-						s_leftLastRippleTime = std::chrono::steady_clock::time_point{};
+					 s_leftLastRippleTime = std::chrono::steady_clock::time_point{};
 					 s_rightLastRippleTime = std::chrono::steady_clock::time_point{};
 
 						// Yield the iteration to stop processing immediately
@@ -734,10 +945,10 @@ std::deque<Sample> playerSamples; // samples for player speed estimation
 				rightSubmergedStartMs.store(0);
 
 				// reset emission guards and moving-state logs
-				s_leftRippleEmitted.store(false);
-				s_rightRippleEmitted.store(false);
-				s_prevLeftMoving.store(false);
-				s_prevRightMoving.store(false);
+			 s_leftRippleEmitted.store(false);
+			 s_rightRippleEmitted.store(false);
+			 s_prevLeftMoving.store(false);
+			 s_prevRightMoving.store(false);
 
 				// clear sample buffers and reset prev-sample flags
 				leftSamples.clear();
@@ -747,12 +958,12 @@ std::deque<Sample> playerSamples; // samples for player speed estimation
 				havePrevRight = false;
 
 				// reset last-in-water flags
-				lastLeftInWater = false;
-				lastRightInWater = false;
+			 lastLeftInWater = false;
+			 lastRightInWater = false;
 
 				// reset recent timers
-				s_leftLastRippleTime = std::chrono::steady_clock::time_point{};
-				s_rightLastRippleTime = std::chrono::steady_clock::time_point{};
+			 s_leftLastRippleTime = std::chrono::steady_clock::time_point{};
+			 s_rightLastRippleTime = std::chrono::steady_clock::time_point{};
 
 				// skip the rest of this monitoring iteration
 				std::this_thread::sleep_for(std::chrono::milliseconds(kPollIntervalMs));
@@ -765,115 +976,51 @@ std::deque<Sample> playerSamples; // samples for player speed estimation
 			if (leftInWater) {
 				leftControllerDepth = leftWaterHeight - leftPos.z;
 				if (leftControllerDepth <0.0f) leftControllerDepth =0.0f;
+				// record surface Z for potential frost spawn when left triggers
+				InteractiveWaterVR::s_frostSpawnWaterHeight.store(leftWaterHeight);
 			}
 			if (rightInWater) {
 				rightControllerDepth = rightWaterHeight - rightPos.z;
 				if (rightControllerDepth <0.0f) rightControllerDepth =0.0f;
+				// record surface Z for potential frost spawn when right triggers (overwrite with latest)
+				InteractiveWaterVR::s_frostSpawnWaterHeight.store(rightWaterHeight);
 			}
 			s_leftControllerDepth.store(leftControllerDepth);
 		 s_rightControllerDepth.store(rightControllerDepth);
 
-			// Per-controller depth shutdown: if a controller goes too deep, suspend detection for that hand only.
-			constexpr float kControllerDepthShutdown =15.0f; // meters
-			if (leftControllerDepth >= kControllerDepthShutdown) {
-				// Treat as not-in-water for this iteration and clear left-specific transient state
-				leftInWater = false;
-				lastLeftInWater = false;
-				leftSubmerged.store(false);
-				lastLeftTransitionMs.store(0);
-				leftSubmergedStartMs.store(0);
-				// Reset left emission/gesture state
-			 s_leftRippleEmitted.store(false);
- s_prevLeftMoving.store(false);
-				// clear left samples and mark no previous
-				leftSamples.clear();
-				havePrevLeft = false;
-				// reset left wake timers
-				s_leftLastWakeMs.store(0);
-				s_leftLastEntrySoundMs.store(0);
-				s_leftLastWakeMoveMs.store(0);
-				s_leftLastRippleTime = std::chrono::steady_clock::time_point{};
-			}
-			if (rightControllerDepth >= kControllerDepthShutdown) {
-				// Treat as not-in-water for this iteration and clear right-specific transient state
-				rightInWater = false;
-				lastRightInWater = false;
-				rightSubmerged.store(false);
-				lastRightTransitionMs.store(0);
-				rightSubmergedStartMs.store(0);
-				// Reset right emission/gesture state
-			 s_rightRippleEmitted.store(false);
- s_prevRightMoving.store(false);
-				// clear right samples and mark no previous
-				rightSamples.clear();
-				havePrevRight = false;
-				// reset right wake timers
-			 s_rightLastWakeMs.store(0);
- s_rightLastEntrySoundMs.store(0);
- s_rightLastWakeMoveMs.store(0);
- s_rightLastRippleTime = std::chrono::steady_clock::time_point{};
+			// Controller depth logging (rate-limited and change-thresholded)
+			{
+				long long nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+				// Player depth logging (rate-limited and change-thresholded)
+				float prevPlayer = s_prevPlayerDepth.load();
+				long long lastPlayerMs = s_lastPlayerDepthLogMs.load();
+				// compute player depth relative to water (0.0 when not in water)
+				float playerDepth =0.0f;
+				{
+					float wh =0.0f;
+					if (IsPointInWater(playerPos, wh)) {
+						playerDepth = wh - playerPos.z;
+						if (playerDepth <0.0f) playerDepth =0.0f;
+					}
+				}
+				if (playerDepth >0.0f && ((nowMs - lastPlayerMs) >= kPlayerDepthLogIntervalMs || std::fabs(playerDepth - prevPlayer) >= kPlayerDepthLogDelta)) {
+					// Depth logging removed per request; still update stored values to preserve behavior
+					s_prevPlayerDepth.store(playerDepth);
+					s_lastPlayerDepthLogMs.store(nowMs);
+				}
 			}
 
-			// Update transition timestamps (ms since steady_clock epoch) so forced entry/exit ripples
- 			// are permitted only within a short window after transition. Do NOT flip the file-scope
- 			// submerged flags here — postpone until after emission logic so queued main-thread tasks
- 			// that may execute outside the forced window are not incorrectly suppressed by the
- 			// "already submerged" check.
-		 if (leftInWater && !lastLeftInWater) {
-			 long long nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
-			 lastLeftTransitionMs.store(nowMs);
-			 // mark submerged start time
-			 leftSubmergedStartMs.store(nowMs);
-			 // ignore tiny Z jitter transitions: require previous pos was sufficiently above surface to count as entry
-			 if (!(prevLeftPos.z - leftWaterHeight > cfgMinZDiffForEntryExit)) {
-			 } else {
-			 }
- }
- if (!leftInWater && lastLeftInWater) {
-			 long long nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
-			 lastLeftTransitionMs.store(nowMs);
-			 // clear submerged start (we are exiting)
-			 long long start = leftSubmergedStartMs.load();
-			 long long submergedMs =0;
-			 if (start !=0) submergedMs = nowMs - start;
-			 // Clear start immediately so other logic knows we're no longer submerged
-			 leftSubmergedStartMs.store(0);
-			 // ignore tiny Z jitter transitions on exit: require current pos sufficiently above previous water height
-			 if (!(leftPos.z - prevLeftWaterHeight > cfgMinZDiffForEntryExit)) {
-			 } else {
-			 }
- }
- if (rightInWater && !lastRightInWater) {
-			 long long nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
-			 lastRightTransitionMs.store(nowMs);
-			 // mark submerged start time for right
-			 rightSubmergedStartMs.store(nowMs);
-			 if (!(prevRightPos.z - rightWaterHeight > cfgMinZDiffForEntryExit)) {
-			 } else {
-			 }
- }
- if (!rightInWater && lastRightInWater) {
-			 long long nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
-			 lastRightTransitionMs.store(nowMs);
-			 long long start = rightSubmergedStartMs.load();
-			 long long submergedMs =0;
-			 if (start !=0) submergedMs = nowMs - start;
-			 rightSubmergedStartMs.store(0);
-			 if (!(rightPos.z - prevRightWaterHeight > cfgMinZDiffForEntryExit)) {
-			 } else {
-			 }
- }
-
+			// Restore timing and movementlocals (were accidentally removed) so subsequent movement detection compiles
 			auto now = std::chrono::steady_clock::now();
 			float leftDt =0.0f;
-			float rightDt = 0.0f;
+			float rightDt =0.0f;
 			if (havePrevLeft) leftDt = std::chrono::duration<float>(now - prevLeftTime).count();
 			if (havePrevRight) rightDt = std::chrono::duration<float>(now - prevRightTime).count();
 
 			// use cfg variables for thresholds
 			float movingConfirm = cfgMovingConfirmSeconds;
 			float jitterThreshold = cfgJitterThresholdAdjusted;
-			float movingThreshold = cfgMovingThresholdAdjusted;
+		 float movingThreshold = cfgMovingThresholdAdjusted;
 
 			// --- Movement detection (use translational delta from sample buffer to ignore rotation) ---
 			if (havePrevLeft && leftDt >1e-6f) {
@@ -886,7 +1033,7 @@ std::deque<Sample> playerSamples; // samples for player speed estimation
 						float dx = sCur.pos.x - sPrev.pos.x;
 						float dy = sCur.pos.y - sPrev.pos.y;
 						float dz = sCur.pos.z - sPrev.pos.z;
-						// use full3D translational magnitude (helps detect vertical movement as well)
+						// use full3D translational speed (helps detect vertical movement as well)
 						speed = std::sqrt(dx * dx + dy * dy + dz * dz) / (float)ds;
 					}
 				}
@@ -942,7 +1089,7 @@ std::deque<Sample> playerSamples; // samples for player speed estimation
 						float dy = sCur.pos.y - sPrev.pos.y;
 						float dz = sCur.pos.z - sPrev.pos.z;
 						// use full3D translational magnitude
-						speedR = std::sqrt(dx * dx + dy * dy + dz * dz) / (float)ds;
+					 speedR = std::sqrt(dx * dx + dy * dy + dz * dz) / (float)ds;
 					}
 				}
 
@@ -980,12 +1127,13 @@ std::deque<Sample> playerSamples; // samples for player speed estimation
 			}
 			// ---------------------------------------------------------
 
+
 			// Determine wake speed threshold (same used by spawn logic)
 			float wakeSpeedThreshold = std::max(0.01f, movingThreshold *0.5f);
 
-			// Determine whether each hand is currently producing wake ripples (submerged && above threshold)
-			bool leftProducingWake = (leftInWater && recentLeftSpeed > wakeSpeedThreshold);
-			bool rightProducingWake = (rightInWater && recentRightSpeed > wakeSpeedThreshold);
+			// Determine whether each hand is currently producing wake ripples (submerged, above threshold, and deep enough)
+			bool leftProducingWake = (leftInWater && recentLeftSpeed > wakeSpeedThreshold && leftControllerDepth >= kMinWakeDepthMeters);
+			bool rightProducingWake = (rightInWater && recentRightSpeed > wakeSpeedThreshold && rightControllerDepth >= kMinWakeDepthMeters);
 
 			// Emit logs when producing state changes (use atomics topersist across thread runs)
 			{
@@ -1004,13 +1152,41 @@ std::deque<Sample> playerSamples; // samples for player speed estimation
 				}
 			}
 
+			// Update public movement state atomics (used by sound decision logic)
+ s_leftIsMoving.store(leftMoving);
+ s_rightIsMoving.store(rightMoving);
+
+ // Auto-toggle per-controller detection based on movement state
+ if (leftMoving != prevLeftMovingLocal) {
+ prevLeftMovingLocal = leftMoving;
+ s_leftDetectionActive.store(leftMoving);
+ IW_LOG_INFO("Left water detection %s", leftMoving ? "enabled" : "disabled");
+ }
+ if (rightMoving != prevRightMovingLocal) {
+ prevRightMovingLocal = rightMoving;
+ s_rightDetectionActive.store(rightMoving);
+ IW_LOG_INFO("Right water detection %s", rightMoving ? "enabled" : "disabled");
+ }
+
+ // Update sneak+depth suppression flags: suppress sounds while player is sneaking and controller depth >=2.0 m
+ // These remain set until conditions are cleared (player stops sneaking or controller rises above threshold)
+ if (player) {
+ if (curSneaking && leftControllerDepth >=2.0f) s_leftSuppressDueToSneakDepth.store(true);
+ else s_leftSuppressDueToSneakDepth.store(false);
+ if (curSneaking && rightControllerDepth >=2.0f) s_rightSuppressDueToSneakDepth.store(true);
+ else s_rightSuppressDueToSneakDepth.store(false);
+ } else {
+ s_leftSuppressDueToSneakDepth.store(false);
+ s_rightSuppressDueToSneakDepth.store(false);
+ }
+
 			// Spawn wake ripples immediately when submerged AND moving; call helper directly for zero-frame latency
 			if (cfgWakeEnabled) {
 				// Use instantaneous recent translational speed. Use a more sensitive threshold so wakes spawn immediately
 				// float wakeSpeedThreshold = std::max(0.01f, movingThreshold *0.5f); // moved above
 				auto nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
 				// LEFT
-				if (leftInWater && recentLeftSpeed > wakeSpeedThreshold) {
+				if (s_leftDetectionActive.load() && leftInWater && recentLeftSpeed > wakeSpeedThreshold && leftControllerDepth >= kMinWakeDepthMeters) {
 					long long lastMs = s_leftLastWakeMs.load();
 					if (cfgWakeSpawnMs ==0 || nowMs - lastMs >= cfgWakeSpawnMs) {
 						// compute multiplier from recent speed
@@ -1050,8 +1226,47 @@ std::deque<Sample> playerSamples; // samples for player speed estimation
 			}
 			// ---------------------------------------------------------
 
+			// RIGHT
+			{
+				long long nowMsR = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+				if (s_rightDetectionActive.load() && rightInWater && recentRightSpeed > wakeSpeedThreshold && rightControllerDepth >= kMinWakeDepthMeters) {
+					long long lastMsR = s_rightLastWakeMs.load();
+					if (cfgWakeSpawnMs ==0 || nowMsR - lastMsR >= cfgWakeSpawnMs) {
+						float multR = cfgWakeMinMultiplier;
+						if (cfgWakeScaleMultiplier >0.0f) {
+							multR = recentRightSpeed * cfgWakeScaleMultiplier;
+							if (multR < cfgWakeMinMultiplier) multR = cfgWakeMinMultiplier;
+							if (multR > cfgWakeMaxMultiplier) multR = cfgWakeMaxMultiplier;
+						}
+						RE::NiPoint3 wakePosR = rightPos;
+						wakePosR.z = rightWaterHeight;
+						float baseR = cfgWakeAmt;
+						float finalAmtR = baseR * multR;
+						auto taskIntfWakeR = SKSE::GetTaskInterface();
+						if (taskIntfWakeR) {
+							std::function<void()> wfnR = [wakePosR, finalAmtR]() {
+								if (s_gameLoadInProgress.load()) return;
+								EmitWakeRipple(false, wakePosR, finalAmtR);
+							};
+							taskIntfWakeR->AddTask(wfnR);
+						} else {
+							if (!s_gameLoadInProgress.load()) {
+								EmitWakeRipple(false, wakePosR, finalAmtR);
+							}
+						}
+						s_rightLastWakeMs.store(nowMsR);
+						// Attempt wake-move sound for right
+						if (!TryPlayWakeMoveSound(false)) {
+						}
+					}
+				}
+			}
+
 			// Left entry -> emit single entry ripple if downward Z speed exceeds configured threshold
-			if (leftInWater && !lastLeftInWater) {
+			if (s_leftDetectionActive.load() && leftInWater && !lastLeftInWater) {
+				long long nowMsEntryL = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+				lastLeftTransitionMs.store(nowMsEntryL);
+				leftSubmergedStartMs.store(nowMsEntryL);
 
 				RE::NiPoint3 impactPos = leftPos;
 				if (havePrevLeft) {
@@ -1173,7 +1388,7 @@ std::deque<Sample> playerSamples; // samples for player speed estimation
 									RE::NiPoint3 ripPos = impactPos + dir *0.2f; ripPos.z = impactPos.z;
 									EmitSplashIfAllowed(true, ripPos, amt *0.25f, true,1, "left_entry_dir");
 									// Play splash sound based on downSpeed band from SpellInteractionsVR.esp
-									if (allowSound) PlaySplashSoundForDownSpeed(true, downSpeed);
+									if (allowSound) PlaySplashSoundForDownSpeed(true, downSpeed, /*requireMoving=*/false);
 								};
 								taskIntf->AddTask(fn);
 							}
@@ -1188,7 +1403,11 @@ std::deque<Sample> playerSamples; // samples for player speed estimation
 			}
 
 			// Left exit -> emit single exit ripple if upward Z speed exceeds configured threshold
-			if (!leftInWater && lastLeftInWater) {
+			if (s_leftDetectionActive.load() && !leftInWater && lastLeftInWater) {
+				long long nowMsExitL = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+				lastLeftTransitionMs.store(nowMsExitL);
+				leftSubmergedStartMs.store(0);
+
 				RE::NiPoint3 impactPos = leftPos;
 				if (havePrevLeft) {
 					float denom = prevLeftPos.z - leftPos.z;
@@ -1199,10 +1418,8 @@ std::deque<Sample> playerSamples; // samples for player speed estimation
 						impactPos.y = prevLeftPos.y + (leftPos.y - prevLeftPos.y) * t;
 						impactPos.z = prevLeftPos.z + (leftPos.z - prevLeftPos.z) * t;
 						impactPos.z = prevLeftWaterHeight;
-					} else {
-						impactPos.z = prevLeftWaterHeight;
-					}
-				}
+				 }
+			 }
 
 				float upSpeed =0.0f;
 				if (havePrevLeft && leftDt >0.0001f) {
@@ -1249,7 +1466,11 @@ std::deque<Sample> playerSamples; // samples for player speed estimation
 			}
 
 			// Right entry -> emit single entry ripple if downward Z speed exceeds configured threshold
-			if (rightInWater && !lastRightInWater) {
+			if (s_rightDetectionActive.load() && rightInWater && !lastRightInWater) {
+				long long nowMsEntryR = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+				lastRightTransitionMs.store(nowMsEntryR);
+				rightSubmergedStartMs.store(nowMsEntryR);
+
 				RE::NiPoint3 impactPos = rightPos;
 				if (havePrevRight) {
 					float denom = prevRightPos.z - rightPos.z;
@@ -1307,8 +1528,8 @@ std::deque<Sample> playerSamples; // samples for player speed estimation
 									 dir.z =0.0f; dir = Normalize(dir);
 									 RE::NiPoint3 ripPos = impactPos + dir *0.2f; ripPos.z = impactPos.z;
 									 EmitSplashIfAllowed(false, ripPos, amtR *0.25f, true,1, "right_entry_dir");
-									 // Play splash sound for right hand based on downSpeedR
-									 PlaySplashSoundForDownSpeed(false, downSpeedR);
+									 // Play splash sound for right hand based on downSpeedR (allow even if controller not flagged moving yet)
+									 PlaySplashSoundForDownSpeed(false, downSpeedR, /*requireMoving=*/false);
 								 };
 								 taskIntfR->AddTask(fnR);
 							}
@@ -1320,32 +1541,37 @@ std::deque<Sample> playerSamples; // samples for player speed estimation
 				 }
 			 } else {
 			 }
+
+			 // reset entry-emitted guard
+			 s_rightRippleEmitted.store(false);
 			}
 
 			// Right exit -> emit single exit ripple if upward Z speed exceeds configured threshold
-			if (!rightInWater && lastRightInWater) {
-				RE::NiPoint3 impactPos = rightPos;
-				if (havePrevRight) {
-					float denom = prevRightPos.z - rightPos.z;
-					if (std::abs(denom) >1e-6f) {
+			if (s_rightDetectionActive.load() && !rightInWater && lastRightInWater) {
+				long long nowMsExitR = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+			 lastRightTransitionMs.store(nowMsExitR);
+			 rightSubmergedStartMs.store(0);
+
+			 RE::NiPoint3 impactPos = rightPos;
+			 if (havePrevRight) {
+				 float denom = prevRightPos.z - rightPos.z;
+				 if (std::abs(denom) >1e-6f) {
 					 float t = (prevRightPos.z - prevRightWaterHeight) / denom;
 					 t = std::clamp(t,0.0f,1.0f);
 						impactPos.x = prevRightPos.x + (rightPos.x - prevRightPos.x) * t;
 						impactPos.y = prevRightPos.y + (rightPos.y - prevRightPos.y) * t;
-						impactPos.z = prevRightPos.z + (rightPos.z - prevRightPos.z) * t;
-						impactPos.z = prevRightWaterHeight;
-					} else {
-						impactPos.z = prevRightWaterHeight;
-					}
-				}
+						 impactPos.z = prevRightPos.z + (rightPos.z - prevRightPos.z) * t;
+						 impactPos.z = prevRightWaterHeight;
+				 }
+			 }
 
-				float upSpeedR =0.0f;
-				if (havePrevRight && rightDt >0.0001f) {
-					float vz = (rightPos.z - prevRightPos.z) / rightDt;
-					upSpeedR = std::max(0.0f, vz);
-				}
+			 float upSpeedR =0.0f;
+			 if (havePrevRight && rightDt >0.0001f) {
+				 float vz = (rightPos.z - prevRightPos.z) / rightDt;
+				 upSpeedR = std::max(0.0f, vz);
+			 }
 
-				if (havePrevRight && upSpeedR >= cfgExitUpZThreshold && upSpeedR <= kMaxExitUpSpeed) {
+			 if (havePrevRight && upSpeedR >= cfgExitUpZThreshold && upSpeedR <= kMaxExitUpSpeed) {
 				 const float minEmitInterval =0.18f;
 				 float since = std::chrono::duration<float>(now - s_rightLastRippleTime).count();
 				 if (since < minEmitInterval) {
@@ -1380,8 +1606,125 @@ std::deque<Sample> playerSamples; // samples for player speed estimation
  // reset emitted guard
  s_rightRippleEmitted.store(false);
  }
+			//----------------------------------SPELL LOGIC----------------
+			// 
+// Also detect when a controller is submerged while the player has a spell selected for that hand.
+// This logs transitions but does not change any detection/suppression behavior.
+			bool leftSubmergedWithSpell = false;
+			bool rightSubmergedWithSpell = false;
+             RE::MagicItem* leftSpell = nullptr;
+             RE::MagicItem* rightSpell = nullptr;
 
- // --- Update file-scope submerged flags AFTER emission logic ---
+			if (player) {
+				// Actor runtime selectedSpells: index0 == left,1 == right
+				auto& actorRt = player->GetActorRuntimeData();
+				leftSpell = actorRt.selectedSpells[RE::Actor::SlotTypes::kLeftHand];
+				rightSpell = actorRt.selectedSpells[RE::Actor::SlotTypes::kRightHand];
+				const bool leftNearSurface = leftControllerDepth <= kFrostSurfaceDepthTolerance;
+				const bool rightNearSurface = rightControllerDepth <= kFrostSurfaceDepthTolerance;
+
+				leftSubmergedWithSpell = leftInWater && (leftSpell != nullptr) && leftNearSurface;
+				rightSubmergedWithSpell = rightInWater && (rightSpell != nullptr) && rightNearSurface;
+             }
+
+			// helper: gather effect-setting keywords from a spell into a comma-separated C string
+			auto GatherSpellEffectKeywords = [](RE::MagicItem* spell) -> std::string {
+				if (!spell) return {};
+				std::vector<std::string> kwNames;
+				// iterate spell effects
+				for (auto eff : spell->effects) {
+					if (!eff) continue;
+					auto base = eff->baseEffect; // EffectSetting*
+					if (!base) continue;
+					// EffectSetting inherits keyword form behavior; use GetKeywords() span
+					for (auto kw : base->GetKeywords()) {
+						if (!kw) continue;
+						// BSFixedString -> c_str()
+						const char* id = kw->formEditorID.c_str();
+						if (id && id[0]) kwNames.emplace_back(id);
+						else {
+							char buf[32];
+							std::snprintf(buf, sizeof(buf), "0x%08X", kw->formID);
+							kwNames.emplace_back(buf);
+						}
+					}
+				}
+				// join
+				std::string joined;
+				for (size_t i =0; i < kwNames.size(); ++i) {
+					if (i) joined += ", ";
+					joined += kwNames[i];
+				}
+				return joined;
+			};
+
+			// Log transitions for submerged-with-spell state (rate-limited implicitly by state changes)
+			{
+				bool prev = s_prevLeftSubmergedWithSpell.load();
+				if (leftSubmergedWithSpell != prev) {
+					s_prevLeftSubmergedWithSpell.store(leftSubmergedWithSpell);
+					if (leftSubmergedWithSpell) {
+						std::string klist = GatherSpellEffectKeywords(leftSpell);
+						if (klist.empty()) IW_LOG_INFO("Left controller submerged while a spell is selected (no effect keywords)");
+						else IW_LOG_INFO("Left controller submerged while a spell is selected -> effect keywords: %s", klist.c_str());
+					} else {
+						IW_LOG_INFO("Left controller no longer submerged with a selected spell");
+					}
+				}
+			}
+			{
+				bool prev = s_prevRightSubmergedWithSpell.load();
+				if (rightSubmergedWithSpell != prev) {
+					s_prevRightSubmergedWithSpell.store(rightSubmergedWithSpell);
+					if (rightSubmergedWithSpell) {
+						std::string klist = GatherSpellEffectKeywords(rightSpell);
+						if (klist.empty()) IW_LOG_INFO("Right controller submerged while a spell is selected (no effect keywords)");
+						else IW_LOG_INFO("Right controller submerged while a spell is selected -> effect keywords: %s", klist.c_str());
+					} else {
+						IW_LOG_INFO("Right controller no longer submerged with a selected spell");
+					}
+				}
+			}
+
+			// --- New: update global keyword-submerged flags (MagicDamageFire / Shock / Frost) ---
+			// Evaluate whether either hand is submerged with a spell that contains each keyword.
+			// Set the global atomic flags and log transitions when they change.
+			{
+				bool leftFireNow = (leftSubmergedWithSpell && SpellHasKeyword(leftSpell, "MagicDamageFire"));
+				bool rightFireNow = (rightSubmergedWithSpell && SpellHasKeyword(rightSpell, "MagicDamageFire"));
+				// update per-hand flags so other modules (spell monitor) can react to the correct hand
+				s_submergedMagicDamageFireLeft.store(leftFireNow);
+			 s_submergedMagicDamageFireRight.store(rightFireNow);
+			 bool fireNow = leftFireNow || rightFireNow;
+			 bool prevFire = s_submergedMagicDamageFire.load();
+			 if (fireNow != prevFire) {
+				 s_submergedMagicDamageFire.store(fireNow);
+				 IW_LOG_INFO("MagicDamageFire submerged=%s", fireNow ? "true" : "false");
+			 }
+			}
+			{
+				bool shockNow = (leftSubmergedWithSpell && SpellHasKeyword(leftSpell, "MagicDamageShock")) ||
+								(rightSubmergedWithSpell && SpellHasKeyword(rightSpell, "MagicDamageShock"));
+				bool prevShock = s_submergedMagicDamageShock.load();
+				if (shockNow != prevShock) {
+					s_submergedMagicDamageShock.store(shockNow);
+					IW_LOG_INFO("MagicDamageShock submerged=%s", shockNow ? "true" : "false");
+				}
+			}
+			{
+				bool leftFrostNow = (leftSubmergedWithSpell && SpellHasKeyword(leftSpell, "MagicDamageFrost"));
+				bool rightFrostNow = (rightSubmergedWithSpell && SpellHasKeyword(rightSpell, "MagicDamageFrost"));
+				s_submergedMagicDamageFrostLeft.store(leftFrostNow);
+			 s_submergedMagicDamageFrostRight.store(rightFrostNow);
+			 bool frostNow = leftFrostNow || rightFrostNow;
+			 bool prevFrost = s_submergedMagicDamageFrost.load();
+			 if (frostNow != prevFrost) {
+				 s_submergedMagicDamageFrost.store(frostNow);
+				 IW_LOG_INFO("MagicDamageFrost submerged=%s", frostNow ? "true" : "false");
+			 }
+			}
+
+			// --- Update file-scope submerged flags AFTER emission logic ---
 	 leftSubmerged.store(leftInWater);
  rightSubmerged.store(rightInWater);
 
@@ -1410,10 +1753,11 @@ std::deque<Sample> playerSamples; // samples for player speed estimation
 
 // Wake ripple helper: adds a ripple at surface and rate-limited logs emission.
 static void EmitWakeRipple(bool isLeft, const RE::NiPoint3& p, float amt) {
- auto ws = RE::TESWaterSystem::GetSingleton();
- if (ws) {
- ws->AddRipple(p, amt);
- }
+	if (s_suspendAllDetections.load()) return;
+	auto ws = RE::TESWaterSystem::GetSingleton();
+	if (ws) {
+		ws->AddRipple(p, amt);
+	}
 }
 
 void StartWaterMonitoring() {
@@ -1426,8 +1770,6 @@ void StartWaterMonitoring() {
 	// reset player swimming state
 	s_prevPlayerSwimming.store(false);
 	s_thread = std::thread(MonitoringThread);
-	// monitoring start log silenced per request
-	// InteractiveWaterVR::AppendToPluginLog("INFO", "StartWaterMonitoring: monitoring started");
 }
 
 void StopWaterMonitoring() {
@@ -1438,8 +1780,72 @@ void StopWaterMonitoring() {
  s_prevRightMoving.store(false);
 	// reset player swimming state
 	s_prevPlayerSwimming.store(false);
-}
+	StopSpellUnequipMonitor();
+ }
 
-bool IsMonitoringActive() { return s_running.load(); }
+ bool IsMonitoringActive() { return s_running.load(); }
+
+ // -- PlaySplashSoundForDownSpeed implementation -----------------------------------
+ static void PlaySplashSoundForDownSpeed(bool isLeft, float downSpeed, bool requireMoving /*= true*/) {
+	if (s_suspendAllDetections.load()) return;
+
+	 // Always respect sneak+depth suppression: if player is sneaking and controller submerged >=2m, no sounds
+	 if (isLeft) {
+	 if (s_leftSuppressDueToSneakDepth.load()) return;
+	 } else {
+	 if (s_rightSuppressDueToSneakDepth.load()) return;
+	 }
+
+	 // If caller requires controller to be moving, enforce that; otherwise allow sound even when stationary
+	 if (requireMoving) {
+	 if (isLeft) {
+	 if (!s_leftIsMoving.load()) return;
+	 } else {
+	 if (!s_rightIsMoving.load()) return;
+	 }
+	 }
+
+	SplashBand band = GetSplashBandForDownSpeed(downSpeed);
+	auto desc = LoadSplashSoundDescriptor(band);
+	if (!desc) return;
+	auto node = GetPlayerHandNode(isLeft ? false : true);
+	if (!node) return;
+
+	float vol =0.2f;
+	switch (band) {
+		case SplashBand::VeryLight: vol = cfgSplashVeryLightVol; break;
+		case SplashBand::Light: vol = cfgSplashLightVol; break;
+		case SplashBand::Normal: vol = cfgSplashNormalVol; break;
+		case SplashBand::Hard: vol = cfgSplashHardVol; break;
+	 case SplashBand::VeryHard: vol = cfgSplashVeryHardVol; break;
+		default: vol =0.2f; break;
+	}
+
+	uint32_t id = PlaySoundAtNode(desc, node, node->world.translate, vol);
+	if (id !=0) {
+	 // record the last-entry start time and mark playing
+	 long long nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+	 if (isLeft) {
+	 s_leftLastEntrySoundMs.store(nowMs);
+	 s_leftEntrySoundPlaying.store(true);
+	 } else {
+	 s_rightLastEntrySoundMs.store(nowMs);
+	 s_rightEntrySoundPlaying.store(true);
+	 }
+
+	 // Launch a short-lived thread to clear the playing flag after a conservative timeout
+	 std::thread([isLeft]() {
+	 try {
+	 std::this_thread::sleep_for(std::chrono::milliseconds(kEntrySoundPlayingTimeoutMs));
+	 long long last = isLeft ? s_leftLastEntrySoundMs.load() : s_rightLastEntrySoundMs.load();
+	 long long now = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+	 if ((now - last) >= kEntrySoundPlayingTimeoutMs) {
+	 if (isLeft) s_leftEntrySoundPlaying.store(false);
+	 else s_rightEntrySoundPlaying.store(false);
+	 }
+	 } catch (...) {}
+	 }).detach();
+	}
+}
 
 } // namespace InteractiveWaterVR

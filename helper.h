@@ -9,7 +9,9 @@
 
 namespace InteractiveWaterVR
 {
- // Logging macros forwarding to SKSE::log and also appending to plugin-specific log file
+using VM = RE::BSScript::Internal::VirtualMachine;
+
+// Logging macros forwarding to SKSE::log and also appending to plugin-specific log file
  void AppendToPluginLog(const char* level, const char* fmt, ...);
  std::string GetPluginLogPath();
 
@@ -60,4 +62,26 @@ namespace InteractiveWaterVR
 
  return static_cast<T*>(form);
  }
-}
+
+// SetAngle relocation/wrapper
+ using _SetAngle = bool(*)(RE::BSScript::Internal::VirtualMachine* registry, std::uint32_t stackId, RE::TESObjectREFR* akSource, float afXAngle, float afYAngle, float afZAngle);
+ extern REL::Relocation<_SetAngle> SetAngle;
+ 
+ // MoveTo relocation/wrapper
+ using _MoveTo = void(*)(RE::BSScript::Internal::VirtualMachine* registry, std::uint32_t stackId, RE::TESObjectREFR* akSource, RE::TESObjectREFR* refObj, float afXOffset, float afYOffset, float afZOffset, bool abMatchRotation);
+ extern REL::Relocation<_MoveTo> MoveTo;
+ 
+ // Delete relocation/wrapper
+ using _Delete = void(*)(VM* registry, std::uint32_t stackId, RE::TESObjectREFR* obj);
+ extern REL::Relocation<_Delete> Delete;
+
+ // Helper to call SetAngle on the main thread via SKSE task interface
+ void SetAngleFunc(RE::TESObjectREFR* akSource, float xAngle, float yAngle, float zAngle);
+
+ // Helper to call MoveTo on the main thread via SKSE task interface
+ void MoveToFunc(RE::TESObjectREFR* akSource, RE::TESObjectREFR* refObj, float xOffset, float yOffset, float zOffset, bool matchRotation);
+
+ // Helper to safely delete an object via Papyrus VM on the main thread
+ void DeleteFunc(RE::TESObjectREFR* obj);
+ 
+ }
